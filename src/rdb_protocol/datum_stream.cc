@@ -70,6 +70,13 @@ bool hash_ranges_t::totally_exhausted() const {
     return true;
 }
 
+bool active_ranges_t::totally_exhausted() const {
+    for (auto &&pair : ranges) {
+        if (!pair.second.totally_exhausted()) return false;
+    }
+    return true;
+}
+
 store_key_t truncate_and_get_left(active_ranges_t *ranges) {
     const store_key_t *smallest_left = &store_key_max;
     for (auto &&pair: ranges->ranges) {
@@ -135,11 +142,23 @@ boost::optional<std::map<region_t, store_key_t> > active_ranges_to_hints(
         switch (pair.second.state()) {
         case range_state_t::ACTIVE:
             for (auto &&hash_pair : pair.second.hash_ranges) {
-                hints[region_t(hash_pair.first.beg,
-                               hash_pair.first.end,
-                               pair.first)] = !reversed(sorting)
-                    ? hash_pair.second.key_range.left
-                    : hash_pair.second.key_range.right.key_or_max();
+                switch (hash_pair.second.state) {
+                case range_state_t::ACTIVE:
+                    r_sanity_check(
+                        pair.first.contains_key(
+                            !reversed(sorting)
+                            ? hash_pair.second.key_range.left
+                            : hash_pair.second.key_range.right.key_or_max()));
+                    hints[region_t(hash_pair.first.beg,
+                                   hash_pair.first.end,
+                                   pair.first)] = !reversed(sorting)
+                        ? hash_pair.second.key_range.left
+                        : hash_pair.second.key_range.right.key_or_max();
+                    break;
+                case range_state_t::SATURATED: break;
+                case range_state_t::EXHAUSTED: break;
+                default: unreachable();
+                }
             }
             break;
         case range_state_t::SATURATED: break;
@@ -262,6 +281,9 @@ raw_stream_t unshard(
     // debugf("%s\n", debug_str(*active_ranges).c_str());
 
     raw_stream_t items;
+    // We should always get an empty substream that updates a single hash
+    // shard's last_considered_key, at the very least.
+    r_sanity_check(stream.substreams.size() != 0);
     // While updating the `last_key`s we check that we're only getting results
     // for shards we actually have.  This also guarantees that we won't silently
     // discard data in the logic below.
@@ -273,7 +295,7 @@ raw_stream_t unshard(
             if (ft != it->second.hash_ranges.end()) {
                 // We should never get a result for an inactive region.
                 r_sanity_check(ft->second.state == range_state_t::ACTIVE);
-                debugf("LAST_KEY: %s\n", debug_str(pair.second.last_key).c_str());
+                // debugf("LAST_KEY: %s\n", debug_str(pair.second.last_key).c_str());
                 if (!reversed(sorting)) {
                     ft->second.key_range.left = pair.second.last_key;
                     if (ft->second.key_range.left != store_key_max) {
@@ -305,14 +327,39 @@ raw_stream_t unshard(
     pseudoshards.reserve(active_ranges->ranges.size() * CPU_SHARDING_FACTOR);
     for (auto &&pair : active_ranges->ranges) {
         for (auto &&hash_pair : pair.second.hash_ranges) {
+            if (pair.second.state != range_state_t::ACTIVE) continue;
             keyed_stream_t *fresh = nullptr;
             auto it = stream.substreams.find(
                 region_t(hash_pair.first.beg, hash_pair.first.end, pair.first));
-            if (it != stream.substreams.end()) fresh = &it->second;
+            if (it != stream.substreams.end()) {
+                fresh = &it->second;
+            } else {
+                // If we enter this branch we got no data back from this shard
+                // despite issuing a read to it, which means it's exhausted.
+                if (!reversed(sorting)) {
+                    hash_pair.second.key_range.left =
+                        hash_pair.second.key_range.right.internal_key;
+                    if (hash_pair.second.key_range.left != store_key_max) {
+                        hash_pair.second.key_range.left.increment();
+                    } else {
+                        // Just to make sure the range is considered empty.  In
+                        // the future we'll probably get rid of unbounded right
+                        // bounds and this logic can go away.
+                        hash_pair.second.key_range.right =
+                            key_range_t::right_bound_t(store_key_t::max());
+                    }
+                } else {
+                    // The right bound is open so we don't need to decrement.
+                    hash_pair.second.key_range.right = key_range_t::right_bound_t(
+                        hash_pair.second.key_range.left);
+                }
+                r_sanity_check(hash_pair.second.key_range.is_empty());
+                hash_pair.second.state = range_state_t::EXHAUSTED;
+            }
             // If there's any data for a hash shard, we need to consider it
             // while unsharding.  Note that the shard may have *already been
             // marked exhausted* in the step above.
-            if (fresh != nullptr || !hash_pair.second.totally_exhausted()) {
+            if (fresh != nullptr || hash_pair.second.cache.size() > 0) {
                 pseudoshards.emplace_back(sorting, &hash_pair.second, fresh);
             }
         }
@@ -580,20 +627,15 @@ rget_reader_t::do_range_read(env_t *env, const read_t &read) {
 
 bool rget_reader_t::load_items(env_t *env, const batchspec_t &batchspec) {
     started = true;
-    if (items_index >= items.size() && !shards_exhausted) { // read some more
+    while (items_index >= items.size() && !shards_exhausted()) {
         items_index = 0;
         // `active_range` is guaranteed to be full after the `do_range_read`,
         // because `do_range_read` is responsible for updating the active range.
         items = do_range_read(
             env,
             readgen->next_read(active_ranges, stamp, transforms, batchspec));
-        // Everything below this point can handle `items` being empty (this is
-        // good hygiene anyway).
         r_sanity_check(active_ranges);
         readgen->sindex_sort(&items);
-    }
-    if (items_index >= items.size()) {
-        shards_exhausted = true;
     }
     return items_index < items.size();
 }
@@ -749,6 +791,7 @@ rget_read_t primary_readgen_t::next_read_impl(
     region_t region = active_ranges
         ? region_t(active_ranges_to_range(*active_ranges))
         : region_t(original_datum_range.to_primary_keyrange());
+    r_sanity_check(!region.inner.is_empty());
     return rget_read_t(
         std::move(stamp),
         std::move(region),
